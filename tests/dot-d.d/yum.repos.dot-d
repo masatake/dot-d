@@ -1,0 +1,2 @@
+--suffix=.repo
+--output-file=/tmp/yum.repo

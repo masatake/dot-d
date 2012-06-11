@@ -1,0 +1,599 @@
+#!/bin/bash
+########################################################################
+#
+# dot-d: A tool concatenating configuration snippets into one master configuration file
+#
+# Copyright (C) 2012 Masatake YAMATO
+#
+# Author: Masatake YAMATO <yamato@redhat.com>
+#
+# program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+########################################################################
+#
+# update-conf.d(https://github.com/masatake/update-conf.d) inspires me 
+# to write this script. Different from update-conf.d dot-d supports 
+# .d style configuration itself.
+#
+
+_commands=""
+_dot_d_dir=${DOT_D_DIR:-/etc/dot-d.d}
+_sysconf_dir=${SYSCONF_DIR:-/etc}
+
+_conf_suffix=.conf
+_conf_output_file=
+_conf_input_dir=
+
+#
+#
+#
+# UTILS
+#
+#
+function_p()
+{
+    if ( LANG=C type "${1}" | grep -q function ) > /dev/null 2>&1; then
+	return 0
+    else
+	return 2
+    fi
+}
+
+member_p()
+{
+    local t0="$1"
+    local t1
+
+    shift
+
+    for t1 in "$@"; do
+	if [ "${t0}" = "${t1}" ]; then
+	    return 0
+	fi
+    done
+
+    return 1
+}
+
+defcommand()
+{
+    _commands="$1 ${_commands}"
+}
+
+command_p()
+{
+    member_p "$1" ${_commands}
+    return $?
+}
+
+
+verify_file()
+{
+    local test_flags=$1
+    local file=$2
+
+    while [ -n "${test_flags}" ]; do
+	case "${test_flags:0:1}" in 
+	    e)
+		if ! [ -e "${file}" ]; then
+		    echo "No such file: ${file}" >&2
+		    return 2
+		fi
+		;;
+	    f)
+		if ! [ -f "${file}" ]; then
+		    echo "Not regular file: ${file}" >&2
+		    return 2
+		fi
+		;;
+	    r)
+		if ! [ -r "${file}" ]; then
+		    echo "Not readable: ${file}" >&2
+		    return 2
+		fi
+		;;
+	    *)
+		echo "INTERNAL ERROR(verify_file)" >&2
+		echo "UNKNOWN TEST FLAGS: ${test_flags}" >&2
+		return 2
+		;;
+	esac
+	test_flags=${test_flags:1}
+    done
+    return 0
+}
+
+
+verify_dot_d_dir()
+{
+    if [[ -z "${_dot_d_dir}" ]]; then
+	echo "\$DOT_D_D is empty" >&2
+	return 2
+    elif ! [ -d "${_dot_d_dir}" ]; then
+	echo "No such directory: ${_dot_d_dir}" >&2
+	return 2
+    fi
+    
+    return 0
+}
+
+function verify_arg_suffix
+{
+    return 0
+}
+
+function verify_sysconf_dir
+{
+    if [[ -z "${_sysconf_dir}" ]]; then
+	echo "\$_sysconf_dir is empty" >&2
+	return 2
+    fi
+    if ! [[ -d "${_sysconf_dir}" ]]; then
+	echo "No such directory: ${_sysconf_dir}" >&2
+	return 2
+    fi
+    
+    return 0
+}
+
+function verify_arg_output_file
+{
+    return 0
+}
+
+function verify_arg_input_dir
+{
+    if ! [[ -d "${_conf_input_dir}" ]]; then
+	echo "No such directory: ${_conf_input_dir}" >&2
+	return 2
+    fi
+    return 0
+}
+
+function verify_args
+{
+    if ! verify_arg_suffix; then
+	return 2
+    fi
+
+    if ! verify_arg_output_file; then
+	return 2
+    fi
+
+    if ! verify_arg_input_dir; then
+	return 2
+    fi
+    
+    return 0
+}
+
+conf2name()
+{
+    basename "${1}" .dot-d
+}
+
+conf2args()
+{
+    local conf=$1
+    local name=$(conf2name "${conf}")
+    local args
+    local a
+    local s
+
+
+    _conf_output_file="${name}"
+    _conf_input_dir="${name}".d
+
+    store ()
+    {
+	while [ $# -gt 0 ]; do
+	    case $1 in
+		--suffix)
+		    shift
+		    _conf_suffix=$1
+		    shift
+		    ;;
+		--suffix=*)
+		    _conf_suffix=${1/--suffix=/}
+		    shift
+		    ;;
+		--output-file)
+		    shift
+		    _conf_output_file=$1
+		    shift
+		    ;;
+		--output-file=*)
+		    _conf_output_file=${1/--output-file=/}
+		    shift
+		    ;;
+		--input-dir)
+		    shift
+		    _conf_input_dir=$1
+		    shift
+		    ;;
+		--input-dir=*)
+		    _conf_input_dir=${1/--input-dir=/}
+		    shift
+		    ;;
+		*)
+		    echo "Unexpected argument $a in $conf" >&2
+		    return 2
+	    esac		
+	done
+
+	return 0
+    }
+
+    args=$(grep -v ^# "$conf" | grep -v '^[ \t]*$')
+    store $args
+    
+    if [[ "${_conf_output_file:0:1}" != / ]]; then
+	_conf_output_file="${_sysconf_dir}"/"${_conf_output_file}"
+    fi
+
+
+    if [[ "${_conf_input_dir}" != / ]]; then
+	_conf_input_dir="${_sysconf_dir}"/"${_conf_input_dir}"
+    fi
+
+    s=$?
+    if [[ $s != 0 ]]; then
+	return $s
+    fi
+
+    return 0
+}
+
+function find_dot_d_conf
+{
+    name=$1
+    conf=
+
+    for conf in "${_dot_d_dir}"/*.dot-d; do
+	if [ "${conf}" = "${_dot_d_dir}/*.dot-d" ]; then
+	    echo "No dot-d file for $name" >&2
+	    return 2
+	fi
+	
+	if [ `conf2name "${conf}"` = "${name}" ]; then
+	    if ! verify_file efr "${conf}"; then
+		return 2
+	    fi
+
+	    echo "${conf}"
+	    return 0
+	fi
+    done
+
+    echo "No dot-d file for $name" >&2
+    return 2
+}
+
+#
+#
+#
+# CMDS
+#
+#
+
+#
+# Help
+#
+defcommand help
+function cmd_help_help_invocation
+{
+    echo "	`basename $0` --help"
+    echo "	`basename $0` help"
+}
+
+function cmd_help_do
+{
+    local c=
+    local c0=
+
+    echo "Invocation:"
+    for c in ${_commands}; do
+	c=cmd_${c}_help_invocation
+	if function_p ${c}; then
+	    $c $0
+	fi
+    done
+
+    echo 
+    echo "Options:"
+    echo "[common option]"
+    echo "	--dot-d-dir DIR:	a directory where configuration files for dot-d itself is(${_dot_d_dir})"
+    echo "	--sysconfig-dir	DIR:	default directory where NAME file and NAME.d directory are(${_sysconf_dir})"
+    echo "			The value for --sysconfig-dir does not reflect to the value for --dot-d-dir."
+    echo
+
+    for c in ${_commands}; do
+	c0=$c
+	c=cmd_${c0}_help_options
+	if function_p $c; then
+	    echo "[$c0 subcommand optoins]"
+	    $c $0
+	fi
+    done
+
+    echo
+    echo "Environment variables:"
+    echo "	DOT_D_DIR: gives default value for --dot-d-dir"
+    echo "	SYSCONF_DIR: give default value for --sysconfig-dir"
+
+    echo
+    echo "Exit status:"
+    echo "	0: Successful"
+    echo "	2: Error"
+    echo
+    echo "Note:"
+    echo "	NAME must not start with --."
+
+    
+}
+
+#
+# Concat
+#
+defcommand concat
+function cmd_concat_help_invocation
+{
+    echo "	`basename $0` [COMMON-OPTION] concat [CONCAT-OPTOINS] NAME"
+}
+
+function cmd_concat_help_options
+{
+    echo "	--preview|--dry-run	Show the result to stdout instead of updating the configuration file"
+    echo "	--diff	                Compare the concatenated data with the current configuration file(implying --preview)"
+    echo "	--diff-with DIFF-FLAG   Compare the concatenated data with the current configuration file using DIFF-FLAG(implying --preview and --diff)"
+}
+
+
+function cmd_concat_do
+{
+    local name
+    local conf
+    local s
+    local dry_run
+    local diff_p
+    local diff_flag=-uN
+    local tmp_output_file
+
+
+    while [ $# -gt 0 ]; do
+	case "$1" in
+	    --dry-run|--preview)
+		dry_run=1
+		shift
+		;;
+	    --diff)
+		diff_p=1
+		shift
+		;;
+	    --diff-with)
+		diff_p=1
+		shift
+		diff_flag=$1
+		shift
+		;;
+	    --diff-with=*)
+		diff_p=1
+		diff_flag=${1/--diff-with=/}
+		shift
+		;;
+	    -*|--*)
+		echo "Unknown option for concat command: $1" 1>&2
+		return 2
+		;;
+	    *)
+		break
+	esac
+    done
+
+    name=$1
+    if [[ -z "$name" ]]; then
+	echo "No name given for concat command: $1" 1>&2
+	return 2
+    fi
+
+    
+    verify_sysconf_dir
+    s=$?
+    if [[ $s != 0 ]]; then
+	return $s
+    fi
+    
+    verify_dot_d_dir
+    s=$?
+    if [[ $s != 0 ]]; then
+	return $?
+    fi
+
+    conf=$(find_dot_d_conf $name)
+    s=$?
+    if [[ $s != 0 ]]; then
+	return $s
+    fi
+
+    conf2args "${conf}"
+    s=$?
+    if [[ $s != 0 ]]; then
+	return $s
+    fi
+    
+    verify_args
+    s=$?
+    if [[ $s != 0 ]]; then
+	return $s
+    fi
+
+
+    if ( ! [[ -z "${diff_p}" ]] ) && 
+	[[ -e "${_conf_output_file}" ]] && ( ! cat "${_conf_output_file}" > /dev/null 2>&1 ); then
+	echo "cannot read ${output_file} for comparing" 1>&2
+	return 2
+    fi
+	
+    tmp_output_file=`mktemp`
+    trap "rm -f ${tmp_output_file}" 0
+    touch "${tmp_output_file}"
+    
+    # name, suffix, output_file, input_dir
+    concat "${_conf_input_dir}" "${_conf_suffix}" > "${tmp_output_file}"
+    s=$?
+    if [[ ${s} != 0 ]]; then
+	return 2
+    fi
+	
+
+    if ! [[ -z "${diff_p}" ]]; then
+	if ! [[ -e "${_conf_output_file}" ]]; then
+	    output_file=/dev/null
+	fi
+	diff ${diff_flag} "${_conf_output_file}" "${tmp_output_file}"
+	return $?
+    elif ! [[  -z "${dry_run}" ]]; then
+	cat "${tmp_output_file}"
+	return $?
+    else
+	mv "${tmp_output_file}" "${_conf_output_file}"
+	return $?
+    fi
+}
+
+function concat
+{
+    local input_dir=$1
+    local suffix=$2
+    local i
+
+    for i in "${input_dir}"/*"${suffix}"; do
+	if [[ "$i" == "${input_dir}/*${suffix}" ]]; then
+	    return 0
+	fi
+	
+	if ! cat $i; then
+	    return 2
+	fi
+    done
+    return 0
+}
+
+#
+# List
+#
+defcommand list
+function cmd_list_help_invocation
+{
+    echo "	`basename $0` [COMMON-OPTION] list [LIST-OPTOINS]"
+}
+
+function cmd_list_do
+{
+    local conf
+    local s
+    local c
+
+    verify_dot_d_dir
+    s=$?
+    if [[ $s != 0 ]]; then
+	return $?
+    fi
+
+    echo "# NAME	DOT_D_CONF	STATUS	INPUT_DIR SUFFIX OUTPUT_FILE"
+    for conf in "${_dot_d_dir}"/*.dot-d; do
+	if [ "${conf}" = "${_dot_d_dir}/*.dot-d" ]; then
+	    break
+	fi
+	
+	conf2args "${conf}" 2> /dev/null
+	s=$?
+	if [[ $s != 0 ]]; then
+	    c=!
+	else
+	    c="_ ${_conf_input_dir}	${_conf_suffix}	${_conf_output_file}"
+	fi
+
+	echo `conf2name "${conf}"`	"${conf}"	"$c"	
+    done
+    
+    return 0
+}
+
+#
+#
+#
+# main
+#
+#
+function main
+{
+    local c=
+
+    while [ $# -gt 0 ]; do
+	case "$1" in
+	    --help|-h)
+		shift
+		main help "$@"
+		return $?
+		;;
+	    --sysconf-dir)
+		shift
+		_sysconf_dir=$1
+		shift
+		;;
+	    --sysconf-dir=*)
+		_sysconf_dir=${1/--sysconf-dir=/}
+		shift
+		;;
+	    --dot-d-dir)
+		shift
+		_dot_d_dir=$1
+		shift
+		;;
+	    --dot-d-dir=*)
+		_dot_d_dir=${1/--dot-d-dir=/}
+		shift
+		;;
+	    --*|-*)
+		echo "Uknown option: $1" 1>&2
+		shift
+		return 2
+		;;
+		*)
+		break
+		;;
+	esac
+    done
+
+		
+    if command_p "$1"; then
+	c=$1
+	shift
+	cmd_"$c"_do "$@"
+	return $?
+    else
+	if [ -z "$1" ]; then
+	    echo "No subcommand given" 1>&2
+	    shift
+	else
+	    echo "Unknown subcommand: $1" 1>&2
+	    shift
+	fi
+	return 2
+    fi
+}
+
+main "$@"
+exit $?
